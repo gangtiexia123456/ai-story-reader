@@ -112,34 +112,61 @@ class AIAnalyzer {
     this.lastCall = now;
 
     try {
-      const response = await fetch(this.apiEndpoint, {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 15000);
+
+      const response = await fetch('https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ' + this.apiKey,
+        },
         body: JSON.stringify({
-          image: imageData,
-          apiKey: this.apiKey,
+          model: 'qwen-vl-plus',
+          messages: [{
+            role: 'user',
+            content: [
+              { type: 'image_url', image_url: { url: imageData } },
+              { type: 'text', text: '请看这张绘本图片，用温暖的语气给3-8岁小朋友讲一个3-5句的简短故事，并提取2-3个简单英文单词（如物品、颜色、动作等，每词配中文释义）。' },
+            ],
+          }],
         }),
+        signal: controller.signal,
       });
+      clearTimeout(timeout);
 
       if (!response.ok) {
-        const err = await response.json();
-        throw new Error(err.error || 'API 请求失败');
+        const err = await response.json().catch(() => ({}));
+        throw new Error(err.error?.message || 'API请求失败: ' + response.status);
       }
 
       const data = await response.json();
+      const text = data.choices?.[0]?.message?.content || '';
 
-      // 清理故事文本中的多余空白
-      if (data.story) {
-        data.story = data.story.replace(/\n+/g, ' ').trim();
+      // 解析故事 - 找第一段非空非标记文字
+      const lines = text.split('\n').map(l => l.trim()).filter(l => l);
+      let story = '';
+      for (const line of lines) {
+        if (!line.match(/^[单词成语的?:：]/) && line.length > 5) {
+          story = line;
+          break;
+        }
+      }
+
+      // 解析英文单词
+      const words = [];
+      const wordMatches = [...text.matchAll(/([a-zA-Z]{2,20})\s*[/,]\s*([^\n。！？]+)/g)];
+      for (const m of wordMatches) {
+        words.push({ word: m[1], phonetic: '/' + m[1] + '/', meaning: m[2].trim() });
       }
 
       return {
-        story: data.story || '这幅画真有意思！',
-        words: data.words || [],
-        idiom: data.idiom || null,
+        story: story || '这幅画真有意思！',
+        words: words.slice(0, 3),
+        idiom: null,
       };
     } catch (err) {
-      console.error('AI 分析失败:', err);
+      console.error('AI 分析失败:', err.message);
       return null;
     }
   }
@@ -238,6 +265,35 @@ class TTS {
   constructor() {
     this.synth = window.speechSynthesis;
     this.queue = [];
+    this._voices = [];
+    // Force load voices
+    this._loadVoices();
+    this.synth.onvoiceschanged = () => {
+      this._loadVoices();
+    };
+  }
+
+  _loadVoices() {
+    try {
+      this._voices = this.synth.getVoices() || [];
+    } catch(e) {
+      this._voices = [];
+    }
+  }
+
+  _getVoice(lang) {
+    const voices = this._voices.length > 0 ? this._voices : (this.synth.getVoices() || []);
+    let langVoices = voices.filter(v => v.lang.includes(lang));
+    if (langVoices.length === 0) langVoices = voices;
+    
+    // Female voice preference
+    const femaleNames = lang === 'zh' 
+      ? ['female', 'girl', 'woman', '女', 'Ting', 'Mei', 'Xiao', 'Ya', 'Lili', 'Huihui', 'Kangkang', 'Moyan']
+      : ['female', 'samantha', 'victoria', 'karen', 'moira', 'tessa', 'fiona', 'fei'];
+    
+    return langVoices.find(v => femaleNames.some(n => v.name.toLowerCase().includes(n)))
+           || langVoices.find(v => v.lang.includes(lang === 'zh' ? 'CN' : 'US'))
+           || langVoices[0];
   }
 
   speak(text, priority = false) {
@@ -245,33 +301,13 @@ class TTS {
       this.synth.cancel();
       this.queue = [];
     }
-
     const utterance = new SpeechSynthesisUtterance(text);
     utterance.lang = 'zh-CN';
-    utterance.rate = 0.85;  // 稍慢，温柔
-    utterance.pitch = 1.1;  // 稍高，甜美
+    utterance.rate = 0.85;
+    utterance.pitch = 1.1;
     utterance.volume = 1.0;
-
-    // 优先选女声
-    const voices = this.synth.getVoices();
-    const zhVoices = voices.filter(v => v.lang.includes('zh'));
-    // 找女声：名称中含 female/girl/woman，或者选择评分较高的女声
-    const femaleVoice = zhVoices.find(v => 
-      (v.name.toLowerCase().includes('female') || 
-       v.name.toLowerCase().includes('girl') ||
-       v.name.toLowerCase().includes('woman') ||
-       v.name.includes('女') ||
-       v.name.includes('Ting') ||
-       v.name.includes('Mei') ||
-       v.name.includes('Xiao') ||
-       v.name.includes('Ya') ||
-       v.localVoice) && v.lang.includes('CN')
-    ) || zhVoices.find(v => v.lang.includes('CN') && v.lang.includes('female')) 
-    || zhVoices.find(v => v.lang.includes('CN'))
-    || voices.find(v => v.lang.includes('zh'));
-    
-    if (femaleVoice) utterance.voice = femaleVoice;
-
+    const voice = this._getVoice('zh');
+    if (voice) utterance.voice = voice;
     this.synth.speak(utterance);
   }
 
@@ -280,25 +316,8 @@ class TTS {
     utterance.lang = 'en-US';
     utterance.rate = 0.8;
     utterance.pitch = 1.1;
-
-    const voices = this.synth.getVoices();
-    const enVoices = voices.filter(v => v.lang.includes('en'));
-    const femaleEn = enVoices.find(v => 
-      v.name.toLowerCase().includes('female') ||
-      v.name.toLowerCase().includes('samantha') ||
-      v.name.toLowerCase().includes('victoria') ||
-      v.name.toLowerCase().includes('karen') ||
-      v.name.toLowerCase().includes('moira') ||
-      v.name.toLowerCase().includes('tessa') ||
-      v.name.toLowerCase().includes('fiona') ||
-      v.name.toLowerCase().includes('fei') ||
-      v.localVoice
-    ) || enVoices.find(v => v.lang.includes('US'))
-    || enVoices.find(v => v.lang.includes('GB'))
-    || enVoices[0];
-    
-    if (femaleEn) utterance.voice = femaleEn;
-
+    const voice = this._getVoice('en');
+    if (voice) utterance.voice = voice;
     this.synth.speak(utterance);
   }
 
@@ -373,6 +392,21 @@ function App() {
     }
   }, [apiKey]);
 
+  // Camera stream attachment - runs after isLive changes and DOM updates
+  useEffect(() => {
+    if (isLive && videoRef.current && streamRef.current) {
+      videoRef.current.srcObject = streamRef.current;
+      videoRef.current.play().catch(() => {});
+      detectIntervalRef.current = setInterval(() => captureAndAnalyze(), 1500);
+    }
+    return () => {
+      if (detectIntervalRef.current) {
+        clearInterval(detectIntervalRef.current);
+        detectIntervalRef.current = null;
+      }
+    };
+  }, [isLive]);
+
   const stopCamera = () => {
     if (streamRef.current) {
       streamRef.current.getTracks().forEach(t => t.stop());
@@ -388,18 +422,14 @@ function App() {
   const startCamera = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'environment', width: { ideal: 640 }, height: { ideal: 480 } },
+        video: true,
         audio: false,
       });
       streamRef.current = stream;
-      videoRef.current.srcObject = stream;
-      videoRef.current.play();
+      // Set live state first, srcObject will be set by useEffect
       setIsLive(true);
-
-      // 开始检测
-      detectIntervalRef.current = setInterval(() => captureAndAnalyze(), 1000);
     } catch (err) {
-      alert('无法访问摄像头，请允许摄像头权限！');
+      alert('无法访问摄像头，请允许摄像头权限！错误：' + err.message);
     }
   };
 
@@ -626,22 +656,26 @@ function App() {
 
       {/* 主显示区 */}
       <div className="main-display">
-        {isLive ? (
-          <div className="camera-view">
-            <video ref={videoRef} className="camera-video" playsInline muted />
-            <canvas ref={canvasRef} style={{ display: 'none' }} />
-            {isAnalyzing && <div className="analyzing-overlay">🔍 AI 识别中...</div>}
-          </div>
-        ) : uploadedImage ? (
-          <div className="camera-view">
+        <div className="camera-view">
+          <video
+            ref={videoRef}
+            className="camera-video"
+            style={{ display: isLive ? 'block' : 'none' }}
+            playsInline
+            autoPlay
+            muted
+          />
+          {uploadedImage && !isLive && (
             <img src={uploadedImage} className="camera-video" alt="已上传图片" />
-            {isAnalyzing && <div className="analyzing-overlay">🔍 AI 识别中...</div>}
-          </div>
-        ) : (
-          <div className="camera-placeholder">
-            📷 打开摄像头对准绘本，或上传图片
-          </div>
-        )}
+          )}
+          {!isLive && !uploadedImage && (
+            <div className="camera-placeholder">
+              📷 打开摄像头对准绘本，或上传图片
+            </div>
+          )}
+          {isAnalyzing && <div className="analyzing-overlay">🔍 AI 识别中...</div>}
+          <canvas ref={canvasRef} className="capture-canvas" />
+        </div>
       </div>
 
       {/* 控制按钮 */}
@@ -655,6 +689,9 @@ function App() {
               📁 上传图片
               <input type="file" accept="image/*" onChange={handleImageUpload} style={{ display: 'none' }} />
             </label>
+            <button className="test-sound-btn" onClick={() => { if (ttsRef.current) ttsRef.current.speak('你好，我是你的AI绘本助手，正在为你讲故事！'); }}>
+              🔊 测试声音
+            </button>
           </>
         ) : (
           <button className="stop-btn" onClick={stopCamera}>
